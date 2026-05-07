@@ -1,0 +1,46 @@
+[package]
+name = "udemyget"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "udemyget"
+path = "src/main.rs"
+
+[dependencies]
+# TUI
+ratatui       = "0.29"
+crossterm     = "0.28"
+
+# Async runtime
+tokio         = { version = "1", features = ["full"] }
+tokio-util    = { version = "0.7", features = ["io"] }
+futures       = "0.3"
+
+# HTTP — rquest is a drop-in reqwest fork that emulates a real browser's
+# TLS + HTTP/2 fingerprint (JA3/JA4).  Udemy sits behind Cloudflare which
+# binds the cf_clearance session cookie to the browser's TLS fingerprint;
+# plain reqwest (OpenSSL/rustls) has a different fingerprint → 403.
+# rquest patches the TLS handshake at the BoringSSL level so Cloudflare
+# sees exactly the same cipher suites / extensions as real Firefox 136.
+rquest        = { version = "5.1", features = ["json", "stream", "gzip", "brotli"] }
+rquest-util   = "2.2"
+
+# JSON / serialisation
+serde         = { version = "1", features = ["derive"] }
+serde_json    = "1"
+
+# Error handling
+anyhow        = "1"
+
+# HLS parsing
+m3u8-rs       = "6"
+
+# AES-128 CBC for encrypted HLS segments (same deps as omniget)
+aes           = "0.8"
+cbc           = { version = "0.1", features = ["block-padding"] }
+
+# Utility
+dirs          = "5"
+sanitize-filename = "0.5"
+rand          = "0.8"
