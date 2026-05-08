@@ -2,6 +2,10 @@
 name = "udemyget"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
+description = "Terminal UI downloader for owned Udemy courses"
+repository = "https://github.com/youruser/udemyget"
+readme = "README.md"
 
 [[bin]]
 name = "udemyget"
