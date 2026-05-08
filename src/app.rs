@@ -4,10 +4,22 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::{mpsc::UnboundedSender, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 use crate::api;
+
+/// Global cap on simultaneous lecture downloads (API fetch + file write).
+/// Keeps socket + file-descriptor counts well below the OS default ulimit.
+const MAX_CONCURRENT_DOWNLOADS: usize = 10;
+
+static DOWNLOAD_SEM: std::sync::OnceLock<Arc<Semaphore>> = std::sync::OnceLock::new();
+
+fn download_sem() -> Arc<Semaphore> {
+    DOWNLOAD_SEM
+        .get_or_init(|| Arc::new(Semaphore::new(MAX_CONCURRENT_DOWNLOADS)))
+        .clone()
+}
 use crate::config::{self, Config};
 use crate::downloader;
 use crate::types::*;
@@ -552,7 +564,28 @@ fn spawn_download(
     cancel: Arc<CancellationToken>,
     tx: UnboundedSender<AppEvent>,
 ) {
+    let sem = download_sem();
     tokio::spawn(async move {
+        // Acquire a slot before touching the network or filesystem.
+        // Keeps concurrent downloads ≤ MAX_CONCURRENT_DOWNLOADS so we
+        // never exhaust file descriptors or overwhelm the Udemy API.
+        let _permit = match sem.acquire_owned().await {
+            Ok(p) => p,
+            Err(_) => {
+                tx.send(AppEvent::DownloadFailed {
+                    id,
+                    error: "download semaphore closed".to_string(),
+                }).ok();
+                return;
+            }
+        };
+        // _permit is held for the lifetime of this task and released on drop.
+
+        if cancel.is_cancelled() {
+            tx.send(AppEvent::DownloadFailed { id, error: "cancelled".to_string() }).ok();
+            return;
+        }
+
         tx.send(AppEvent::DownloadProgress { id, percent: 0.0 }).ok();
         tx.send(AppEvent::StatusMsg(format!("Fetching stream for lecture {lecture_id}…"))).ok();
 
@@ -581,5 +614,6 @@ fn spawn_download(
             Ok(_)  => { tx.send(AppEvent::DownloadDone { id }).ok(); }
             Err(e) => { tx.send(AppEvent::DownloadFailed { id, error: e.to_string() }).ok(); }
         }
+        // _permit dropped here — frees a slot for the next queued download.
     });
 }
