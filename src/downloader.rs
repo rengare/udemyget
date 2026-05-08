@@ -72,40 +72,68 @@ pub async fn download_lecture(
 
     let client = build_client()?;
 
-    // 1. Try direct MP4 first (best quality, no DRM)
+    // 1. Direct MP4 (no DRM, best quality first)
     for (_, url) in &stream.mp4_urls {
+        if cancel.is_cancelled() { return Err(anyhow!("cancelled")); }
         match download_direct_inner(&client, url, output, &stream.referer,
                                    progress_tx.clone(), cancel.clone()).await {
             Ok(bytes) => return Ok(bytes),
             Err(e) => eprintln!("[dl] MP4 failed ({e}), trying next…"),
         }
-        if cancel.is_cancelled() { return Err(anyhow!("cancelled")); }
     }
 
-    // 2. Try each HLS URL in order.
-    //    Some may be FairPlay / SAMPLE-AES — skip those and keep going.
+    // 2. HLS — try each URL; skip DRM-protected streams.
+    //    CBCS (/cbcs/ in path) = CMAF Common Encryption (Widevine/FairPlay).
+    //    We detect those at the URL level to avoid a round-trip.
+    let mut drm_count = 0usize;
     let mut last_err: Option<anyhow::Error> = None;
+
     for m3u8_url in &stream.hls_urls {
         if cancel.is_cancelled() { return Err(anyhow!("cancelled")); }
+
+        // Fast-path: CBCS URLs are always DRM — no need to fetch the playlist.
+        if is_cbcs_url(m3u8_url) {
+            drm_count += 1;
+            last_err = Some(anyhow!("CMAF/CBCS stream"));
+            continue;
+        }
+
         match download_hls_inner(&client, m3u8_url, output, &stream.referer,
                                  progress_tx.clone(), cancel.clone()).await {
             Ok(bytes) => return Ok(bytes),
             Err(e) if is_drm_skip(&e) => {
-                eprintln!("[dl] HLS DRM on {m3u8_url}, trying next…");
+                drm_count += 1;
                 last_err = Some(e);
             }
             Err(e) => return Err(e),
         }
     }
 
+    // All sources exhausted — build a clear, actionable error.
+    let total = stream.hls_urls.len();
+    if drm_count > 0 {
+        return Err(anyhow!(
+            "All {total} HLS stream(s) are DRM-protected (CMAF/CBCS — \
+             Widevine/FairPlay).\n\
+             This lecture cannot be downloaded without a DRM license.\n\
+             If the course allows offline access the direct MP4 \
+             download_urls should be populated; try refreshing cookies.txt."
+        ));
+    }
+
     Err(last_err.unwrap_or_else(|| anyhow!("no download source available")))
 }
 
-/// Returns true for errors that mean “this stream uses DRM we can’t handle;
-/// skip to the next URL” rather than a real network/IO error.
+/// True for CMAF/CBCS Common Encryption streams — always DRM-protected,
+/// no point fetching the playlist.
+fn is_cbcs_url(url: &str) -> bool {
+    url.contains("/cbcs/") || url.contains("/cenc/")
+}
+
+/// True for errors that mean “this stream uses DRM we can’t handle;
+/// skip to the next URL” rather than a real network/IO failure.
 fn is_drm_skip(e: &anyhow::Error) -> bool {
-    let s = e.to_string();
-    s.contains("drm:skip")
+    e.to_string().contains("drm:skip")
 }
 
 // ── HTTP client ───────────────────────────────────────────────────────────
