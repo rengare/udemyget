@@ -158,7 +158,7 @@ pub async fn fetch_courses(token: &str) -> anyhow::Result<Vec<Course>> {
         "{}/users/me/subscribed-courses/\
          ?ordering=-last_accessed\
          &page_size=100\
-         &fields[course]=id,title,num_published_lectures",
+         &fields[course]=id,title,num_published_lectures,visible_instructors",
         BASE
     );
 
@@ -188,7 +188,15 @@ pub async fn fetch_courses(token: &str) -> anyhow::Result<Vec<Course>> {
                     .get("num_published_lectures")
                     .and_then(|v| v.as_u64())
                     .map(|n| n as u32);
-                courses.push(Course { id, title, num_published_lectures: num });
+                let instructor = item
+                    .get("visible_instructors")
+                    .and_then(|v| v.as_array())
+                    .and_then(|a| a.first())
+                    .and_then(|i| i.get("display_name"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Unknown Instructor")
+                    .to_string();
+                courses.push(Course { id, title, num_published_lectures: num, instructor });
             }
         }
 

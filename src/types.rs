@@ -10,6 +10,7 @@ pub struct Course {
     pub id: u64,
     pub title: String,
     pub num_published_lectures: Option<u32>,
+    pub instructor: String,
 }
 
 #[derive(Debug, Clone)]

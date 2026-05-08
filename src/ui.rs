@@ -197,10 +197,7 @@ fn render_login(f: &mut Frame, area: Rect, app: &App) {
 
 fn render_courses(f: &mut Frame, area: Rect, app: &App) {
     if app.loading {
-        let p = Paragraph::new(Line::from(Span::styled(
-            "  Loading courses…",
-            style_warn(),
-        )));
+        let p = Paragraph::new(Line::from(Span::styled("  Loading coursesâ¦", style_warn())));
         f.render_widget(p, area);
         return;
     }
@@ -214,7 +211,7 @@ fn render_courses(f: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
-    if app.courses.is_empty() {
+    if app.course_rows.is_empty() {
         let p = Paragraph::new(Line::from(Span::styled(
             "  No courses found. Press r to refresh.",
             style_dim(),
@@ -224,32 +221,53 @@ fn render_courses(f: &mut Frame, area: Rect, app: &App) {
     }
 
     let selected = app.course_list_state.selected().unwrap_or(0);
+    let total_courses: usize = app.course_groups.iter().map(|g| g.courses.len()).sum();
 
     let items: Vec<ListItem> = app
-        .courses
+        .course_rows
         .iter()
         .enumerate()
-        .map(|(i, course)| {
+        .map(|(i, row)| {
             let is_sel = i == selected;
-            let lectures = course
-                .num_published_lectures
-                .map(|n| format!("  {n} lectures"))
-                .unwrap_or_default();
-
-            let style = if is_sel { style_selected() } else { style_normal() };
-            let prefix = if is_sel { "▶ " } else { "  " };
-
-            ListItem::new(Line::from(vec![
-                Span::styled(prefix, style_accent()),
-                Span::styled(&course.title, style),
-                Span::styled(lectures, style_dim()),
-            ]))
+            match row {
+                crate::app::CourseRow::Group(gi) => {
+                    let group = &app.course_groups[*gi];
+                    let arrow = if group.expanded { "â¼" } else { "â¶" };
+                    let count = group.courses.len();
+                    let style = if is_sel { style_selected() } else { style_accent().add_modifier(Modifier::BOLD) };
+                    ListItem::new(Line::from(vec![
+                        Span::styled(format!("{arrow} "), style),
+                        Span::styled(&group.instructor, style),
+                        Span::styled(
+                            format!("  ({count} courses)"),
+                            if is_sel { style_selected() } else { style_dim() },
+                        ),
+                    ]))
+                }
+                crate::app::CourseRow::Course(gi, ci) => {
+                    let course = &app.course_groups[*gi].courses[*ci];
+                    let lectures = course
+                        .num_published_lectures
+                        .map(|n| format!("{n} lectures"))
+                        .unwrap_or_default();
+                    let style = if is_sel { style_selected() } else { style_normal() };
+                    ListItem::new(Line::from(vec![
+                        Span::styled("    ", style_dim()),
+                        Span::styled(&course.title, style),
+                        Span::styled(format!("  {lectures}"), style_dim()),
+                    ]))
+                }
+            }
         })
         .collect();
 
     let block = Block::default()
         .title(Span::styled(
-            format!(" Courses ({}) ", app.courses.len()),
+            format!(
+                " {} courses â {} instructors ",
+                total_courses,
+                app.course_groups.len()
+            ),
             style_header(),
         ))
         .borders(Borders::ALL)
@@ -258,7 +276,6 @@ fn render_courses(f: &mut Frame, area: Rect, app: &App) {
         .padding(Padding::horizontal(1));
 
     let list = List::new(items).block(block).highlight_style(style_selected());
-
     let mut state = app.course_list_state.clone();
     f.render_stateful_widget(list, area, &mut state);
 }

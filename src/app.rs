@@ -48,8 +48,10 @@ pub struct App {
     pub login_error: Option<String>,
     pub loading: bool,
 
-    // ---- Courses tab
-    pub courses: Vec<Course>,
+    // ---- Courses tab (grouped by instructor)
+    pub course_groups: Vec<CourseGroup>,
+    /// Flat visible rows: alternating Group headers and Course entries.
+    pub course_rows: Vec<CourseRow>,
     pub course_list_state: ratatui::widgets::ListState,
 
     // ---- Curriculum tab
@@ -67,6 +69,19 @@ pub struct App {
     pub status_msg: Option<String>,
     pub error_msg: Option<String>,
     pub should_quit: bool,
+}
+
+#[derive(Clone)]
+pub struct CourseGroup {
+    pub instructor: String,
+    pub courses: Vec<Course>,
+    pub expanded: bool,
+}
+
+#[derive(Clone)]
+pub enum CourseRow {
+    Group(usize),           // index into course_groups
+    Course(usize, usize),   // (group_idx, course_idx)
 }
 
 #[derive(Clone)]
@@ -90,7 +105,8 @@ impl App {
             cookie_file,
             login_error: None,
             loading: false,
-            courses: Vec::new(),
+            course_groups: Vec::new(),
+            course_rows: Vec::new(),
             course_list_state: ratatui::widgets::ListState::default(),
             current_course: None,
             curriculum: Vec::new(),
@@ -192,13 +208,13 @@ impl App {
             KeyCode::Char('q') | KeyCode::Char('Q') => { self.should_quit = true; }
             KeyCode::Up   | KeyCode::Char('k') => self.courses_up(),
             KeyCode::Down | KeyCode::Char('j') => self.courses_down(),
-            KeyCode::Enter => self.open_curriculum(tx),
+            KeyCode::Enter => self.courses_enter(tx),
             KeyCode::Char('d') => self.download_selected_course(tx),
             KeyCode::Char('r') => self.refresh_courses(tx),
             KeyCode::Char('L') => {
-                // Force re-authentication: go back to setup screen
                 self.config.cookie.clear();
-                self.courses.clear();
+                self.course_groups.clear();
+                self.course_rows.clear();
                 self.login_error = None;
                 self.screen = AppScreen::Login;
             }
@@ -253,7 +269,7 @@ impl App {
 
     fn courses_down(&mut self) {
         let sel = self.course_list_state.selected().unwrap_or(0);
-        if sel + 1 < self.courses.len() {
+        if sel + 1 < self.course_rows.len() {
             self.course_list_state.select(Some(sel + 1));
         }
     }
@@ -307,9 +323,40 @@ impl App {
 
     // ── Actions ───────────────────────────────────────────────────────────
 
-    fn open_curriculum(&mut self, tx: UnboundedSender<AppEvent>) {
-        let idx = self.course_list_state.selected().unwrap_or(0);
-        let Some(course) = self.courses.get(idx) else { return };
+    // -- Course group helpers --
+
+    pub fn rebuild_course_rows(&mut self) {
+        self.course_rows.clear();
+        for (gi, group) in self.course_groups.iter().enumerate() {
+            self.course_rows.push(CourseRow::Group(gi));
+            if group.expanded {
+                for (ci, _) in group.courses.iter().enumerate() {
+                    self.course_rows.push(CourseRow::Course(gi, ci));
+                }
+            }
+        }
+        let max = self.course_rows.len().saturating_sub(1);
+        let sel = self.course_list_state.selected().unwrap_or(0).min(max);
+        if !self.course_rows.is_empty() {
+            self.course_list_state.select(Some(sel));
+        }
+    }
+
+    /// Enter on a Group expands/collapses it; Enter on a Course opens curriculum.
+    fn courses_enter(&mut self, tx: UnboundedSender<AppEvent>) {
+        let sel = self.course_list_state.selected().unwrap_or(0);
+        match self.course_rows.get(sel).cloned() {
+            Some(CourseRow::Group(gi)) => {
+                self.course_groups[gi].expanded = !self.course_groups[gi].expanded;
+                self.rebuild_course_rows();
+            }
+            Some(CourseRow::Course(gi, ci)) => self.open_curriculum_for(gi, ci, tx),
+            None => {}
+        }
+    }
+
+    fn open_curriculum_for(&mut self, gi: usize, ci: usize, tx: UnboundedSender<AppEvent>) {
+        let course = &self.course_groups[gi].courses[ci];
         let course_id = course.id;
         let cookie = self.config.cookie.clone();
         self.loading = true;
@@ -320,6 +367,10 @@ impl App {
                 Err(e)       => { tx.send(AppEvent::Error(e.to_string())).ok(); }
             }
         });
+    }
+
+    fn open_curriculum(&mut self, tx: UnboundedSender<AppEvent>) {
+        self.courses_enter(tx);
     }
 
     fn refresh_courses(&mut self, tx: UnboundedSender<AppEvent>) {
@@ -334,8 +385,18 @@ impl App {
     }
 
     fn download_selected_course(&mut self, tx: UnboundedSender<AppEvent>) {
-        let idx = self.course_list_state.selected().unwrap_or(0);
-        let Some(course) = self.courses.get(idx).cloned() else { return };
+        let sel = self.course_list_state.selected().unwrap_or(0);
+        let course = match self.course_rows.get(sel).cloned() {
+            Some(CourseRow::Course(gi, ci)) => self.course_groups[gi].courses[ci].clone(),
+            Some(CourseRow::Group(gi)) => {
+                self.status_msg = Some(format!(
+                    "Press Enter to expand '{}', then select a course",
+                    self.course_groups[gi].instructor
+                ));
+                return;
+            }
+            None => return,
+        };
         let cookie = self.config.cookie.clone();
         let output_dir = self.config.output_dir.clone();
         let tx2 = tx.clone();
@@ -471,14 +532,16 @@ impl App {
 
             AppEvent::CoursesLoaded(courses) => {
                 self.loading = false;
-                self.courses = courses;
-                if !self.courses.is_empty() {
+                let total = courses.len();
+                self.course_groups = build_course_groups(courses);
+                self.rebuild_course_rows();
+                if !self.course_rows.is_empty() {
                     self.course_list_state.select(Some(0));
                 }
                 self.screen = AppScreen::Courses;
                 self.status_msg = Some(format!(
-                    "{} courses — ↑↓ navigate · Enter open · d download course · r refresh · L re-auth",
-                    self.courses.len()
+                    "{total} courses by {} instructors — Enter expand/open · d download · r refresh",
+                    self.course_groups.len()
                 ));
             }
 
@@ -490,7 +553,10 @@ impl App {
                 }
                 self.rebuild_visible_rows();
                 self.curriculum_list_state.select(Some(0));
-                self.current_course = self.courses.iter().find(|c| c.id == course_id).cloned();
+                self.current_course = self.course_groups.iter()
+                    .flat_map(|g| g.courses.iter())
+                    .find(|c| c.id == course_id)
+                    .cloned();
                 self.screen = AppScreen::Curriculum;
                 let total: usize = self.curriculum.iter().map(|ch| ch.lectures.len()).sum();
                 self.status_msg = Some(format!(
@@ -614,4 +680,19 @@ fn spawn_download(
         }
         // _permit dropped here — frees a slot for the next queued download.
     });
+}
+
+// ── Build course groups (sorted alphabetically by instructor) ─────────────
+
+fn build_course_groups(courses: Vec<Course>) -> Vec<CourseGroup> {
+    use std::collections::BTreeMap;
+    let mut map: BTreeMap<String, Vec<Course>> = BTreeMap::new();
+    for course in courses {
+        map.entry(course.instructor.clone())
+            .or_default()
+            .push(course);
+    }
+    map.into_iter()
+        .map(|(instructor, courses)| CourseGroup { instructor, courses, expanded: false })
+        .collect()
 }
