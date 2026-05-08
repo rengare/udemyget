@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 description = "Terminal UI downloader for owned Udemy courses"
-repository = "https://github.com/youruser/udemyget"
+repository = "https://github.com/rengare/udemyget"
 readme = "README.md"
 
 [[bin]]

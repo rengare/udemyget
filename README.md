@@ -38,7 +38,7 @@ A terminal UI application for downloading your owned Udemy courses, written in R
 ### Build
 
 ```bash
-git clone https://github.com/youruser/udemyget
+git clone https://github.com/rengare/udemyget
 cd udemyget
 cargo build --release
 # binary at ./target/release/udemyget
