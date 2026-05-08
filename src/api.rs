@@ -343,86 +343,74 @@ pub async fn fetch_lecture_streams(
         .get("asset")
         .ok_or_else(|| anyhow!("lecture response has no 'asset'"))?;
 
-    let referer = format!("https://www.udemy.com/course/learn/lecture/{}", lecture_id);
+    let referer = format!("https://www.udemy.com/course/{course_id}/learn/lecture/{lecture_id}");
 
-    // ── Collect HLS URL and direct MP4 options ──────────────────────────────
+    // Collect ALL HLS URLs and MP4 sources.
+    // We store every HLS URL we find; the downloader tries them in order,
+    // skipping any that are DRM-protected (drm:skip sentinel).
+    // download_urls provides direct non-DRM MP4 links when the course
+    // allows offline access.
 
-    let mut hls_url: Option<String> = None;
+    let mut hls_urls: Vec<String> = Vec::new();
     let mut mp4_urls: Vec<(u32, String)> = Vec::new();
 
-    // Prefer media_sources (usually higher quality / more options)
-    if let Some(sources) = asset.get("media_sources").and_then(|v| v.as_array()) {
-        for src in sources {
-            let typ = src.get("type").and_then(|v| v.as_str()).unwrap_or("");
-            let file = src
-                .get("src")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            if file.is_empty() {
-                continue;
-            }
+    macro_rules! add_hls {
+        ($url:expr) => {{ let u: String = $url;
+            if !u.is_empty() && !hls_urls.contains(&u) { hls_urls.push(u); } }};
+    }
+    macro_rules! add_mp4 {
+        ($h:expr, $url:expr) => {{ let u: String = $url;
+            if !u.is_empty() && !mp4_urls.iter().any(|(_, x)| x == &u) { mp4_urls.push(($h, u)); } }};
+    }
+
+    // media_sources
+    if let Some(arr) = asset.get("media_sources").and_then(|v| v.as_array()) {
+        for src in arr {
+            let typ  = src.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            let file = src.get("src") .and_then(|v| v.as_str()).unwrap_or("").to_string();
             if typ.contains("mpegURL") {
-                if hls_url.is_none() {
-                    hls_url = Some(file);
-                }
+                add_hls!(file);
             } else if typ.contains("mp4") || typ.contains("video") {
-                let height = src
-                    .get("res")
-                    .and_then(|v| v.as_str())
-                    .and_then(|s| s.parse::<u32>().ok())
-                    .or_else(|| src.get("res").and_then(|v| v.as_u64()).map(|n| n as u32))
-                    .unwrap_or(0);
-                mp4_urls.push((height, file));
+                let h = src.get("res")
+                    .and_then(|v| v.as_str().and_then(|s| s.parse::<u32>().ok())
+                        .or_else(|| v.as_u64().map(|n| n as u32))).unwrap_or(0);
+                add_mp4!(h, file);
             }
         }
     }
 
-    // Fall back to stream_urls if media_sources didn't give us an HLS URL
-    if hls_url.is_none() {
-        if let Some(video_arr) = asset
-            .pointer("/stream_urls/Video")
-            .and_then(|v| v.as_array())
-        {
-            for item in video_arr {
-                let typ = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                let file = item
-                    .get("file")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                if file.is_empty() {
-                    continue;
-                }
-                if typ.contains("mpegURL") {
-                    if hls_url.is_none() {
-                        hls_url = Some(file);
-                    }
-                } else if typ.contains("mp4") || typ.contains("video") {
-                    let height = item
-                        .get("label")
-                        .and_then(|v| v.as_str())
-                        .and_then(|s| s.parse::<u32>().ok())
-                        .unwrap_or(0);
-                    mp4_urls.push((height, file));
-                }
+    // stream_urls
+    if let Some(arr) = asset.pointer("/stream_urls/Video").and_then(|v| v.as_array()) {
+        for item in arr {
+            let typ  = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            let file = item.get("file").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            if typ.contains("mpegURL") { add_hls!(file); }
+            else if typ.contains("mp4") || typ.contains("video") {
+                let h = item.get("label").and_then(|v| v.as_str())
+                    .and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+                add_mp4!(h, file);
             }
         }
     }
 
-    // Sort MP4s by height descending (best first)
+    // download_urls — direct non-DRM MP4 (when course allows offline access)
+    if let Some(arr) = asset.pointer("/download_urls/Video").and_then(|v| v.as_array()) {
+        for item in arr {
+            let file = item.get("file").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let h = item.get("label").and_then(|v| v.as_str())
+                .and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+            add_mp4!(h, file);
+        }
+    }
+
     mp4_urls.sort_by(|a, b| b.0.cmp(&a.0));
 
-    if hls_url.is_none() && mp4_urls.is_empty() {
+    if hls_urls.is_empty() && mp4_urls.is_empty() {
         return Err(anyhow!(
-            "no downloadable stream found for lecture {} (asset_type: {})",
-            lecture_id,
-            asset
-                .get("asset_type")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown")
+            "no downloadable stream for lecture {lecture_id} (asset_type: {})",
+            asset.get("asset_type").and_then(|v| v.as_str()).unwrap_or("unknown")
         ));
     }
 
-    Ok(LectureStream { hls_url, mp4_urls, referer })
+    Ok(LectureStream { hls_urls, mp4_urls, referer })
 }

@@ -61,7 +61,7 @@ pub async fn download_lecture(
         std::fs::create_dir_all(parent)?;
     }
 
-    // Skip if already downloaded
+    // Already downloaded
     if output.exists() {
         let size = std::fs::metadata(output)?.len();
         if size > 0 {
@@ -72,40 +72,40 @@ pub async fn download_lecture(
 
     let client = build_client()?;
 
-    // Prefer a direct MP4 (first = highest quality due to pre-sort)
-    if let Some((_, url)) = stream.mp4_urls.first() {
-        match download_direct_inner(
-            &client,
-            url,
-            output,
-            &stream.referer,
-            progress_tx.clone(),
-            cancel.clone(),
-        )
-        .await
-        {
+    // 1. Try direct MP4 first (best quality, no DRM)
+    for (_, url) in &stream.mp4_urls {
+        match download_direct_inner(&client, url, output, &stream.referer,
+                                   progress_tx.clone(), cancel.clone()).await {
             Ok(bytes) => return Ok(bytes),
-            Err(e) => {
-                // Log and fall through to HLS
-                eprintln!("[downloader] direct download failed ({e}), trying HLS…");
+            Err(e) => eprintln!("[dl] MP4 failed ({e}), trying next…"),
+        }
+        if cancel.is_cancelled() { return Err(anyhow!("cancelled")); }
+    }
+
+    // 2. Try each HLS URL in order.
+    //    Some may be FairPlay / SAMPLE-AES — skip those and keep going.
+    let mut last_err: Option<anyhow::Error> = None;
+    for m3u8_url in &stream.hls_urls {
+        if cancel.is_cancelled() { return Err(anyhow!("cancelled")); }
+        match download_hls_inner(&client, m3u8_url, output, &stream.referer,
+                                 progress_tx.clone(), cancel.clone()).await {
+            Ok(bytes) => return Ok(bytes),
+            Err(e) if is_drm_skip(&e) => {
+                eprintln!("[dl] HLS DRM on {m3u8_url}, trying next…");
+                last_err = Some(e);
             }
+            Err(e) => return Err(e),
         }
     }
 
-    // Fall back to HLS
-    if let Some(ref m3u8_url) = stream.hls_url {
-        return download_hls_inner(
-            &client,
-            m3u8_url,
-            output,
-            &stream.referer,
-            progress_tx,
-            cancel,
-        )
-        .await;
-    }
+    Err(last_err.unwrap_or_else(|| anyhow!("no download source available")))
+}
 
-    Err(anyhow!("no download source available"))
+/// Returns true for errors that mean “this stream uses DRM we can’t handle;
+/// skip to the next URL” rather than a real network/IO error.
+fn is_drm_skip(e: &anyhow::Error) -> bool {
+    let s = e.to_string();
+    s.contains("drm:skip")
 }
 
 // ── HTTP client ───────────────────────────────────────────────────────────
@@ -422,10 +422,15 @@ async fn download_stream(
 // Key features preserved:
 //   • Master playlist variant selection (≤ requested height)
 //   • AES-128 CBC decryption with per-segment IV
+//   • SAMPLE-AES decryption via MPEG-TS packet parsing
 //   • Ordered BTreeMap-buffered writing
 //   • Parallel segment fetch with Semaphore
 
+#[derive(Clone, Copy, PartialEq)]
+enum EncMethod { Aes128, SampleAes }
+
 struct EncryptionInfo {
+    method: EncMethod,
     key: Vec<u8>,
     iv: Option<[u8; 16]>,
 }
@@ -577,7 +582,11 @@ async fn write_segments_ordered(
         pending.insert(idx, data);
         while let Some(seg_data) = pending.remove(&next) {
             let to_write = if let Some(e) = enc {
-                decrypt_aes128(e, seg_data, next, media_seq)?
+                let iv = compute_iv(&e.iv, next, media_seq);
+                match e.method {
+                    EncMethod::Aes128    => decrypt_aes128(e, seg_data, next, media_seq)?,
+                    EncMethod::SampleAes => decrypt_sample_aes_ts(&seg_data, &e.key, &iv)?,
+                }
             } else {
                 seg_data
             };
@@ -624,7 +633,7 @@ fn compute_iv(explicit: &Option<[u8; 16]>, seg_idx: usize, media_seq: u64) -> [u
     iv
 }
 
-// ── Encryption info fetch ─────────────────────────────────────────────────
+// -- Encryption info fetch --------------------------------------------------
 
 async fn fetch_enc_info(
     client: &reqwest::Client,
@@ -637,23 +646,312 @@ async fn fetch_enc_info(
             match key.method {
                 m3u8_rs::KeyMethod::AES128 => {
                     if let Some(uri) = &key.uri {
-                        let key_url = resolve_url(m3u8_url, uri);
-                        let key_bytes =
-                            fetch_bytes(client, &key_url, referer, 3).await?;
+                        let key_url   = resolve_url(m3u8_url, uri);
+                        let key_bytes = fetch_bytes(client, &key_url, referer, 3).await?;
                         let iv = key.iv.as_ref().map(|s| parse_hex_iv(s));
-                        return Ok(Some(EncryptionInfo { key: key_bytes, iv }));
+                        return Ok(Some(EncryptionInfo {
+                            method: EncMethod::Aes128,
+                            key: key_bytes,
+                            iv,
+                        }));
                     }
                 }
+
                 m3u8_rs::KeyMethod::SampleAES => {
-                    return Err(anyhow!(
-                        "SAMPLE-AES / FairPlay DRM detected — cannot decrypt"
-                    ));
+                    let uri    = key.uri.as_deref().unwrap_or("");
+                    let format = key.keyformat.as_deref().unwrap_or("");
+
+                    // FairPlay: Apple-proprietary DRM, requires device
+                    // attestation.  URI is skd:// or KEYFORMAT identifies
+                    // Apple.  Emit a drm:skip sentinel so download_lecture
+                    // can fall through to the next HLS URL.
+                    if format.contains("com.apple.streamingkeydelivery")
+                        || uri.starts_with("skd://")
+                    {
+                        return Err(anyhow!(
+                            "drm:skip FairPlay (Apple-only) on this HLS stream"
+                        ));
+                    }
+
+                    // Standard SAMPLE-AES: key is a plain 16-byte AES-128 key
+                    // served over HTTPS.  Fetch it and decrypt at TS level.
+                    if let Some(uri) = &key.uri {
+                        let key_url = resolve_url(m3u8_url, uri);
+                        let key_bytes = fetch_bytes(client, &key_url, referer, 3)
+                            .await
+                            .map_err(|e| anyhow!("drm:skip SAMPLE-AES key fetch: {e}"))?;
+                        let iv = key.iv.as_ref().map(|s| parse_hex_iv(s));
+                        return Ok(Some(EncryptionInfo {
+                            method: EncMethod::SampleAes,
+                            key: key_bytes,
+                            iv,
+                        }));
+                    }
+
+                    return Err(anyhow!("drm:skip SAMPLE-AES has no key URI"));
                 }
+
                 _ => {}
             }
         }
     }
     Ok(None)
+}
+
+
+// -- SAMPLE-AES MPEG-TS decryption ------------------------------------------
+//
+// SAMPLE-AES (non-FairPlay) encrypts audio/video samples inside TS packets
+// using AES-128-CBC.  The key is fetched from the HLS EXT-X-KEY URI (same
+// mechanism as AES-128).  Decryption works at the H.264 NAL-unit / AAC-frame
+// level inside reassembled PES packets.
+//
+// Apple HLS SAMPLE-AES spec rules:
+//   Video (H.264): NAL unit types 1 (P-slice) and 5 (IDR) are encrypted.
+//                  The first 32 bytes of each NAL unit payload are left clear;
+//                  all remaining 16-byte-aligned blocks are AES-128-CBC.
+//   Audio (AAC):   Each ADTS frame payload (after the 7/9-byte ADTS header)
+//                  is AES-128-CBC encrypted (block-aligned portion only).
+//   IV:            Per-segment (from EXT-X-KEY IV or derived from sequence
+//                  number), reset at the start of each NAL unit / frame.
+
+const TS_SYNC:   u8    = 0x47;
+const TS_SIZE:   usize = 188;
+const CLEAR_NAL: usize = 32;  // leading bytes of each NAL unit left unencrypted
+
+/// Decrypt a full SAMPLE-AES MPEG-TS segment.
+fn decrypt_sample_aes_ts(data: &[u8], key: &[u8], iv: &[u8; 16]) -> anyhow::Result<Vec<u8>> {
+    let key16: &[u8; 16] = key.try_into()
+        .map_err(|_| anyhow!("SAMPLE-AES key must be 16 bytes, got {}", key.len()))?;
+
+    // Step 1 — collect raw PES payloads per PID from all TS packets
+    let (video_pid, audio_pid) = find_av_pids(data);
+    let mut pkt = data.to_vec();
+
+    // Step 2 — walk TS packets, reassemble PES, decrypt samples, write back
+    let mut i = 0;
+    while i + TS_SIZE <= pkt.len() {
+        if pkt[i] != TS_SYNC { i += 1; continue; }
+
+        let pid          = (((pkt[i+1] & 0x1F) as u16) << 8) | pkt[i+2] as u16;
+        let pusi         = (pkt[i+1] & 0x40) != 0; // payload_unit_start_indicator
+        let adapt        = (pkt[i+3] >> 4) & 0x3;
+        let adapt_len    = if adapt & 0x2 != 0 { 1 + pkt[i+4] as usize } else { 0 };
+        let payload_off  = i + 4 + adapt_len;
+        let payload_end  = i + TS_SIZE;
+
+        if payload_off >= payload_end { i += TS_SIZE; continue; }
+
+        if pid == video_pid {
+            let payload = &mut pkt[payload_off..payload_end];
+            decrypt_h264_pes_payload(payload, key16, iv, pusi)?;
+        } else if pid == audio_pid {
+            let payload = &mut pkt[payload_off..payload_end];
+            decrypt_aac_pes_payload(payload, key16, iv, pusi)?;
+        }
+
+        i += TS_SIZE;
+    }
+
+    Ok(pkt)
+}
+
+/// Find video and audio PIDs by parsing PAT then PMT.
+/// Returns (video_pid, audio_pid); uses 0xFFFF as "not found".
+fn find_av_pids(data: &[u8]) -> (u16, u16) {
+    // 1. Find PMT PID from PAT (PID 0)
+    let mut pmt_pid: u16 = 0xFFFF;
+    let mut i = 0;
+    'pat: while i + TS_SIZE <= data.len() {
+        if data[i] != TS_SYNC { i += 1; continue; }
+        let pid  = (((data[i+1] & 0x1F) as u16) << 8) | data[i+2] as u16;
+        let pusi = (data[i+1] & 0x40) != 0;
+        let adapt = (data[i+3] >> 4) & 0x3;
+        let adapt_len = if adapt & 0x2 != 0 { 1 + data[i+4] as usize } else { 0 };
+        let off = i + 4 + adapt_len;
+        if pid == 0 && pusi && off + 12 < i + TS_SIZE {
+            // pointer_field + table_id + section_length + transport_stream_id + ...
+            let ptr = data[off] as usize;
+            let sec = off + 1 + ptr;
+            if sec + 12 <= i + TS_SIZE && data[sec] == 0x00 {
+                // PAT section: each entry is 4 bytes [program_number(2) + PMT_PID(2)]
+                let sec_len  = (((data[sec+1] & 0x0F) as usize) << 8) | data[sec+2] as usize;
+                let entries  = sec + 8; // skip header (8 bytes)
+                let entries_end = sec + 3 + sec_len - 4; // -4 for CRC
+                let mut e = entries;
+                while e + 4 <= entries_end && e + 4 <= data.len() {
+                    let prog  = ((data[e] as u16) << 8) | data[e+1] as u16;
+                    let ppid  = (((data[e+2] & 0x1F) as u16) << 8) | data[e+3] as u16;
+                    if prog != 0 { pmt_pid = ppid; break 'pat; }
+                    e += 4;
+                }
+            }
+        }
+        i += TS_SIZE;
+    }
+
+    if pmt_pid == 0xFFFF { return (0xFFFF, 0xFFFF); }
+
+    // 2. Find video/audio PIDs from PMT
+    let mut video_pid: u16 = 0xFFFF;
+    let mut audio_pid: u16 = 0xFFFF;
+    let mut i = 0;
+    while i + TS_SIZE <= data.len() {
+        if data[i] != TS_SYNC { i += 1; continue; }
+        let pid  = (((data[i+1] & 0x1F) as u16) << 8) | data[i+2] as u16;
+        let pusi = (data[i+1] & 0x40) != 0;
+        let adapt = (data[i+3] >> 4) & 0x3;
+        let adapt_len = if adapt & 0x2 != 0 { 1 + data[i+4] as usize } else { 0 };
+        let off = i + 4 + adapt_len;
+        if pid == pmt_pid && pusi && off + 12 < i + TS_SIZE {
+            let ptr = data[off] as usize;
+            let sec = off + 1 + ptr;
+            if sec + 12 <= i + TS_SIZE && data[sec] == 0x02 {
+                let sec_len   = (((data[sec+1] & 0x0F) as usize) << 8) | data[sec+2] as usize;
+                let prog_info = (((data[sec+10] & 0x0F) as usize) << 8) | data[sec+11] as usize;
+                let mut e     = sec + 12 + prog_info;
+                let end       = sec + 3 + sec_len - 4;
+                while e + 5 <= end && e + 5 <= data.len() {
+                    let stype    = data[e];
+                    let es_pid   = (((data[e+1] & 0x1F) as u16) << 8) | data[e+2] as u16;
+                    let es_info  = (((data[e+3] & 0x0F) as usize) << 8) | data[e+4] as usize;
+                    // stream types: 0x1B = H.264, 0x24 = H.265, 0x0F/0x11 = AAC
+                    match stype {
+                        0x1B | 0x24 if video_pid == 0xFFFF => video_pid = es_pid,
+                        0x0F | 0x11 if audio_pid == 0xFFFF => audio_pid = es_pid,
+                        _ => {}
+                    }
+                    e += 5 + es_info;
+                }
+            }
+        }
+        i += TS_SIZE;
+    }
+
+    (video_pid, audio_pid)
+}
+
+/// Decrypt H.264 PES payload in-place (SAMPLE-AES NAL unit encryption).
+fn decrypt_h264_pes_payload(
+    payload: &mut [u8],
+    key: &[u8; 16],
+    iv: &[u8; 16],
+    pusi: bool,
+) -> anyhow::Result<()> {
+    // Skip PES header if this is the start of a PES packet
+    let data_start = if pusi { pes_header_len(payload) } else { 0 };
+    let stream = &mut payload[data_start..];
+
+    // Walk H.264 byte stream, find NAL units via start codes
+    let mut pos = 0;
+    while pos + 4 < stream.len() {
+        // Find start code (0x000001 or 0x00000001)
+        let (sc_len, found) = if stream[pos..].starts_with(&[0,0,0,1]) {
+            (4, true)
+        } else if stream[pos..].starts_with(&[0,0,1]) {
+            (3, true)
+        } else {
+            (1, false)
+        };
+        if !found { pos += 1; continue; }
+
+        let nal_start = pos + sc_len;
+        if nal_start >= stream.len() { break; }
+
+        let nal_type = stream[nal_start] & 0x1F;
+
+        // Find end of this NAL unit (next start code or end of stream)
+        let nal_end = {
+            let mut e = nal_start + 1;
+            loop {
+                if e + 3 > stream.len() { e = stream.len(); break; }
+                if stream[e..].starts_with(&[0,0,1]) { break; }
+                if e + 4 <= stream.len() && stream[e..].starts_with(&[0,0,0,1]) { break; }
+                e += 1;
+            }
+            e
+        };
+
+        // Only P-slice (1) and IDR (5) NAL units are encrypted
+        if nal_type == 1 || nal_type == 5 {
+            let payload_start = nal_start + 1;          // skip NAL type byte
+            let clear_end     = payload_start + CLEAR_NAL; // first 32 bytes clear
+            if clear_end < nal_end {
+                let enc_slice = &mut stream[clear_end..nal_end];
+                aes128_cbc_decrypt_inplace(enc_slice, key, iv)?;
+            }
+        }
+
+        pos = nal_end;
+    }
+    Ok(())
+}
+
+/// Decrypt AAC PES payload in-place (SAMPLE-AES ADTS frame encryption).
+fn decrypt_aac_pes_payload(
+    payload: &mut [u8],
+    key: &[u8; 16],
+    iv: &[u8; 16],
+    pusi: bool,
+) -> anyhow::Result<()> {
+    let data_start = if pusi { pes_header_len(payload) } else { 0 };
+    let stream = &mut payload[data_start..];
+
+    let mut pos = 0;
+    while pos + 7 < stream.len() {
+        // ADTS sync word: 0xFFF?
+        if stream[pos] != 0xFF || (stream[pos+1] & 0xF0) != 0xF0 {
+            pos += 1;
+            continue;
+        }
+        let protection   = (stream[pos+1] & 0x01) == 1; // 0 = CRC present
+        let header_len   = if protection { 7 } else { 9 };
+        let frame_len    = (((stream[pos+3] & 0x03) as usize) << 11)
+                         | ((stream[pos+4] as usize) << 3)
+                         | ((stream[pos+5] >> 5) as usize);
+        if frame_len < header_len || pos + frame_len > stream.len() { break; }
+
+        // Encrypt the raw AAC data after the ADTS header
+        let enc_slice = &mut stream[pos+header_len..pos+frame_len];
+        if enc_slice.len() >= 16 {
+            aes128_cbc_decrypt_inplace(enc_slice, key, iv)?;
+        }
+        pos += frame_len;
+    }
+    Ok(())
+}
+
+/// Return the length of a PES packet header (variable-length).
+fn pes_header_len(pes: &[u8]) -> usize {
+    if pes.len() < 9 { return 0; }
+    // PES start code (3) + stream_id (1) + packet_length (2) + flags (2) + header_data_length (1)
+    let hdr_data_len = pes[8] as usize;
+    9 + hdr_data_len
+}
+
+/// AES-128-CBC decrypt the block-aligned prefix of `buf` in-place.
+/// Trailing bytes that don't form a full 16-byte block are left unchanged
+/// (per the SAMPLE-AES spec for audio/video samples).
+fn aes128_cbc_decrypt_inplace(buf: &mut [u8], key: &[u8; 16], iv: &[u8; 16]) -> anyhow::Result<()> {
+    use aes::cipher::{generic_array::GenericArray, BlockDecrypt, KeyInit};
+
+    let blocks = buf.len() / 16;
+    if blocks == 0 { return Ok(()); }
+
+    let cipher = aes::Aes128::new(GenericArray::from_slice(key));
+    let mut prev = *iv;
+
+    for b in 0..blocks {
+        let off   = b * 16;
+        let chunk = &mut buf[off..off + 16];
+        let ct    = *GenericArray::from_slice(chunk);
+        let mut block = ct;
+        cipher.decrypt_block(&mut block);
+        // CBC XOR
+        for j in 0..16 { chunk[j] = block[j] ^ prev[j]; }
+        prev = ct.into();
+    }
+    Ok(())
 }
 
 fn parse_hex_iv(s: &str) -> [u8; 16] {

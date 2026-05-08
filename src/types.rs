@@ -39,7 +39,7 @@ pub struct Lecture {
 #[allow(dead_code)]
 pub struct LectureStream {
     /// HLS master playlist URL
-    pub hls_url: Option<String>,
+    pub hls_urls: Vec<String>,
     /// Direct MP4 options sorted by height descending
     pub mp4_urls: Vec<(u32, String)>,
     /// Referer to pass when downloading
