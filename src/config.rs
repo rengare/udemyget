@@ -5,34 +5,64 @@ use serde::{Deserialize, Serialize};
 
 // ── Directory helpers ─────────────────────────────────────────────────────
 
+/// Returns the udemyget config directory, creating it if it doesn't exist.
+///
+/// Platform paths (from the `dirs` crate):
+///   Linux   : $XDG_CONFIG_HOME/udemyget  (~/.config/udemyget)
+///   macOS   : ~/Library/Application Support/udemyget
+///   Windows : %APPDATA%\udemyget
 fn config_dir() -> PathBuf {
-    dirs::config_dir()
+    let dir = dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join("udemyget")
+        .join("udemyget");
+
+    // Create eagerly — every caller can assume the directory exists.
+    if !dir.exists() {
+        let _ = std::fs::create_dir_all(&dir);
+    }
+
+    dir
 }
 
 fn config_path() -> PathBuf {
     config_dir().join("config.json")
 }
 
-/// Path where the user must paste their Udemy Cookie header string.
-/// Displayed prominently in the UI so the user knows exactly where to edit.
+/// Absolute path to the cookie file.
 pub fn cookie_file_path() -> PathBuf {
     config_dir().join("cookies.txt")
+}
+
+/// Short, human-readable path for display in the TUI.
+///
+/// Replaces the home-directory prefix with `~` and uses the platform's
+/// native path separator, so the string stays short on all OSes:
+///
+///   Linux   : ~/.config/udemyget/cookies.txt               (30 chars)
+///   macOS   : ~/Library/Application Support/udemyget/cookies.txt (50 chars)
+///   Windows : ~\AppData\Roaming\udemyget\cookies.txt        (38 chars)
+pub fn cookie_file_display() -> String {
+    let path = cookie_file_path();
+    if let Some(home) = dirs::home_dir() {
+        if let Ok(rel) = path.strip_prefix(&home) {
+            // std::path::MAIN_SEPARATOR is '/' on Unix, '\\' on Windows.
+            return format!("~{}{}", std::path::MAIN_SEPARATOR, rel.display());
+        }
+    }
+    path.display().to_string()
 }
 
 // ── Cookie file I/O ───────────────────────────────────────────────────────
 
 /// Read and return the cookie string from `cookies.txt`.
-/// Returns `Err` if the file is missing or empty so callers can distinguish
-/// the two cases cleanly.
+/// Returns `Err` if the file is missing or empty.
 pub fn read_cookie_file() -> anyhow::Result<String> {
     let path = cookie_file_path();
     if !path.exists() {
-        anyhow::bail!("file not found: {}", path.display());
+        anyhow::bail!("file not found: {}", cookie_file_display());
     }
     let raw = std::fs::read_to_string(&path)
-        .with_context(|| format!("reading {}", path.display()))?;
+        .with_context(|| format!("reading {}", cookie_file_display()))?;
     let trimmed = raw.trim().to_string();
     if trimmed.is_empty() {
         anyhow::bail!("file is empty");
@@ -40,24 +70,22 @@ pub fn read_cookie_file() -> anyhow::Result<String> {
     Ok(trimmed)
 }
 
-/// Create the cookies.txt file with a placeholder comment if it does not
-/// already exist.  Called once on first run so the path always exists and
-/// the user can open it directly.
+/// Create `cookies.txt` with a step-by-step placeholder comment on first run.
+/// The directory is guaranteed to exist because `config_dir()` creates it.
 pub fn ensure_cookie_file() {
     let path = cookie_file_path();
     if path.exists() {
         return;
     }
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let placeholder = "# Paste your Udemy Cookie header value on the line below and save.\n\
-                       # How to get it:\n\
-                       #   1. Log in to udemy.com in Firefox / Chrome\n\
-                       #   2. DevTools (F12) → Network tab → reload page\n\
-                       #   3. Click any request to udemy.com\n\
-                       #   4. Request Headers → right-click Cookie → Copy value\n\
-                       #   5. Replace this comment with that value and save.\n";
+    let placeholder = "\
+# Paste your Udemy Cookie header value on the line below and save.
+# How to get it:
+#   1. Log in to udemy.com in Firefox / Chrome
+#   2. DevTools (F12) -> Network tab -> reload page
+#   3. Click any request to udemy.com
+#   4. Request Headers -> right-click Cookie -> Copy value
+#   5. Replace this entire comment with that value and save.
+";
     let _ = std::fs::write(&path, placeholder);
 }
 
@@ -100,6 +128,8 @@ pub fn load() -> Config {
 
 pub fn save(config: &Config) -> anyhow::Result<()> {
     let path = config_path();
+    // config_dir() already creates the directory; this is a belt-and-braces
+    // guard in case save() is ever called before App::new().
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("create config dir {:?}", parent))?;

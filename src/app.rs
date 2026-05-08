@@ -81,9 +81,7 @@ impl App {
         config::ensure_cookie_file();
 
         let config = config::load();
-        let cookie_file = config::cookie_file_path()
-            .to_string_lossy()
-            .into_owned();
+        let cookie_file = config::cookie_file_display();
 
         Self {
             screen: AppScreen::Login, // auto_init will advance past this if cookie is valid

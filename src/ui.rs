@@ -143,7 +143,7 @@ fn render_login(f: &mut Frame, area: Rect, app: &App) {
         .direction(Direction::Horizontal)
         .constraints([
             Constraint::Min(0),
-            Constraint::Length(68),
+            Constraint::Length(76),
             Constraint::Min(0),
         ])
         .split(chunks[1]);
